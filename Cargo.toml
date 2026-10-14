@@ -1,0 +1,56 @@
+[package]
+name = "homelab"
+version = "0.1.0"
+edition = "2024"
+description = "Observability and serving for the homelab's axum services, matching homelab-go's signals"
+publish = false
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "matched-path", "query", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-graceful"] }
+tower = { version = "0.5", features = ["util"] }
+percent-encoding = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+hex = "0.4"
+# Bundled so TZ resolves on a scratch image, which has no zoneinfo: Go's
+# time/tzdata import is what weight-tracker relies on for the same reason.
+jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+prometheus = { version = "0.14", default-features = false, features = ["process"] }
+opentelemetry = "0.33"
+opentelemetry_sdk = "0.33"
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "grpc-tonic"] }
+# framehop rather than the default backtrace-rs unwinder: pprof-rs preallocates
+# a table of 16384 sampled stacks of up to 128 frames, and a backtrace-rs frame
+# is big enough that the table alone came to 78 MB, held for the life of the
+# process from the first profile on — past a 128Mi limit. framehop records
+# each frame as one address, and unwinds from the binary's own unwind tables,
+# so it needs no frame pointers.
+pprof = { version = "0.15", default-features = false, features = ["prost-codec", "framehop-unwinder"] }
+
+# The allocator, its stats and its heap profiler. Linux only: jemalloc_pprof
+# reads /proc/self/maps, and the stats exist to be scraped in the cluster. On
+# a Mac the system allocator is used and the jemalloc series are absent.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { version = "0.7", features = ["profiling"], optional = true }
+tikv-jemalloc-ctl = { version = "0.7", features = ["stats"], optional = true }
+# symbolize: function names are resolved in-process, as pprof-rs does for the
+# CPU profile. Pyroscope does not symbolise native addresses itself, so without
+# it the heap flame graph is a wall of hex.
+jemalloc_pprof = { version = "0.9", features = ["symbolize"], optional = true }
+
+[features]
+default = ["jemalloc"]
+# Off for an app that must keep the system allocator; the heap profile and
+# jemalloc_* series go with it.
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "dep:jemalloc_pprof"]
+
+[dev-dependencies]
+http-body-util = "0.1"
+tokio = { version = "1", features = ["test-util"] }

@@ -1,0 +1,76 @@
+# homelab-rs
+
+Observability and serving for the homelab's axum services — the Rust
+counterpart of [homelab-go](https://github.com/jchevertonwynne/homelab-go), held
+to the same contract. An app moved from one to the other emits the same metric
+series, log lines and spans, because the Grafana dashboards and alerts read
+them by name and a renamed one is an empty panel rather than an error.
+
+| | |
+|---|---|
+| `flags` | Go `flag`-style arguments (`-addr :8092`), so a Deployment's `args` carry over unchanged |
+| `logging` | slog-shaped JSON on stdout, with the active span's `trace_id` and `span_id` |
+| `trace` | OTLP/gRPC span export, an otelhttp-shaped server span per request, and `op` for child spans |
+| `metrics` | `http_request_duration_seconds` and `http_requests_in_flight`, plus `tokio_*`, `jemalloc_*` and `process_*` |
+| `http` | wires the middleware onto a router, with net/http's 404, 405 and path-cleaning redirect |
+| `serve` | an HTTP/1 server with timeouts, and shutdown on SIGINT/SIGTERM |
+| `etag` | strong ETags over embedded assets, with ServeContent's conditional and range handling |
+| `profiling` | pprof CPU and heap profiles on their own listener, for Alloy's pyroscope.scrape |
+
+```toml
+homelab = { git = "https://github.com/jchevertonwynne/homelab-rs", tag = "v0.1.0" }
+```
+
+```rust
+homelab::logging::init();
+homelab::profiling::spawn(":6060".into());
+let tracing = homelab::trace::init("echo", "alloy:4317")?;
+let app = homelab::http::instrument(Router::new().route("/", get(handler)));
+homelab::serve::run(":8092", app).await?;
+tracing.shutdown().await;
+```
+
+## The contract with homelab-go
+
+**Route labels and span names use `http.ServeMux` spelling.** An axum route `/`
+is `GET /{$}`, `/static/{*path}` is `/static/`, `/entries/{id}` is unchanged.
+That keeps each endpoint's series continuous across a rewrite. `status` is a
+string label holding the numeric code, labels stay in method/route/status
+order, and the buckets are `prometheus.DefBuckets`.
+
+**Log lines are slog's.** `time` (RFC 3339, milliseconds, local zone from
+`TZ`), `level` (`INFO`, `WARN`, `ERROR`), `msg`, then the event's fields, then
+the trace ids. Alloy makes `level` a label and `trace_id` structured metadata.
+
+**Spans are otelhttp's.** Named `"GET /{$}"` once routed and `"GET"` when
+nothing matched; a server span; an error only for a 5xx; an incoming
+`traceparent` is continued.
+
+**What has no equivalent.** Go's `go_*` runtime series and its goroutine,
+mutex and block profiles. Alloy's requests for those profiles get a 404. The
+`tokio_*` series are the nearest signal: `tokio_alive_tasks` for the goroutine
+count, per-worker busy time for scheduler headroom.
+
+## jemalloc and the heap profile
+
+On Linux, with the default `jemalloc` feature, linking this crate makes
+jemalloc the allocator. That is what the heap profile (`/debug/pprof/heap` and
+`/debug/pprof/allocs`, live allocations as `inuse_space`) and the `jemalloc_*`
+series read. It is C, so building for musl needs a C cross-compiler; the app
+Dockerfiles use zig behind a small wrapper, and the wrapper's comments are the
+place to read about why it looks the way it does.
+
+Heap sampling starts off and is switched on only if jemalloc was built with a
+real unwinder. A build that lost it would otherwise walk frame pointers, which
+Rust code does not keep, and segfault on a sampled allocation. Without one the
+app logs `"heap profiling"` at ERROR and runs without a heap profile.
+
+## Running one in the cluster
+
+Both profilers write temp files, and a scratch image with a read-only root
+has nowhere to put them: mount an `emptyDir` at `/tmp`. Without it the app
+serves normally, every profile request fails, and the app says so at startup.
+
+After the first CPU profile the process holds about 30 MB more than at idle,
+for good: pprof-rs preallocates its sample table. Size memory limits with that
+in mind.
