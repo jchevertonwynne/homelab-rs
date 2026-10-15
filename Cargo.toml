@@ -1,6 +1,6 @@
 [package]
 name = "homelab"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Observability and serving for the homelab's axum services, matching homelab-go's signals"
 publish = false
@@ -26,13 +26,6 @@ prometheus = { version = "0.14", default-features = false, features = ["process"
 opentelemetry = "0.33"
 opentelemetry_sdk = "0.33"
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "grpc-tonic"] }
-# framehop rather than the default backtrace-rs unwinder: pprof-rs preallocates
-# a table of 16384 sampled stacks of up to 128 frames, and a backtrace-rs frame
-# is big enough that the table alone came to 78 MB, held for the life of the
-# process from the first profile on — past a 128Mi limit. framehop records
-# each frame as one address, and unwinds from the binary's own unwind tables,
-# so it needs no frame pointers.
-pprof = { version = "0.15", default-features = false, features = ["prost-codec", "framehop-unwinder"] }
 
 # The allocator, its stats and its heap profiler. Linux only: jemalloc_pprof
 # reads /proc/self/maps, and the stats exist to be scraped in the cluster. On
@@ -40,9 +33,9 @@ pprof = { version = "0.15", default-features = false, features = ["prost-codec",
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = { version = "0.7", features = ["profiling"], optional = true }
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats"], optional = true }
-# symbolize: function names are resolved in-process, as pprof-rs does for the
-# CPU profile. Pyroscope does not symbolise native addresses itself, so without
-# it the heap flame graph is a wall of hex.
+# symbolize: function names are resolved in-process. Pyroscope does not
+# symbolise native addresses itself, so without it the heap flame graph is a
+# wall of hex.
 jemalloc_pprof = { version = "0.9", features = ["symbolize"], optional = true }
 
 [features]

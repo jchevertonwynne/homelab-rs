@@ -16,7 +16,7 @@ them by name and a renamed one is an empty panel rather than an error.
 | `http` | wires the middleware onto a router — plainly, or layered for an app behind an auth wrapper — with net/http's 404, 405 and path-cleaning redirect |
 | `serve` | an HTTP/1 server with timeouts, and shutdown on SIGINT/SIGTERM |
 | `etag` | strong ETags over embedded assets, with ServeContent's conditional and range handling |
-| `profiling` | pprof CPU and heap profiles on their own listener, for Alloy's pyroscope.scrape |
+| `profiling` | a pprof heap profile on its own listener, for Alloy's pyroscope.scrape |
 
 ```toml
 homelab = { git = "https://github.com/jchevertonwynne/homelab-rs", tag = "v0.2.0" }
@@ -59,7 +59,8 @@ nothing matched; a server span; an error only for a 5xx; an incoming
 `traceparent` is continued.
 
 **What has no equivalent.** Go's `go_*` runtime series and its goroutine,
-mutex and block profiles. Alloy's requests for those profiles get a 404. The
+mutex and block profiles — and, deliberately, its CPU profile (see below).
+Alloy's requests for those profiles get a 404. The
 `tokio_*` series are the nearest signal: `tokio_alive_tasks` for the goroutine
 count, per-worker busy time for scheduler headroom.
 
@@ -79,10 +80,18 @@ app logs `"heap profiling"` at ERROR and runs without a heap profile.
 
 ## Running one in the cluster
 
-Both profilers write temp files, and a scratch image with a read-only root
-has nowhere to put them: mount an `emptyDir` at `/tmp`. Without it the app
-serves normally, every profile request fails, and the app says so at startup.
+The heap dump goes through a temp file, and a scratch image with a read-only
+root has nowhere to put one: mount an `emptyDir` at `/tmp`. Without it the app
+serves normally, every heap profile request fails, and the app says so at
+startup.
 
-After the first CPU profile the process holds about 30 MB more than at idle,
-for good: pprof-rs preallocates its sample table. Size memory limits with that
-in mind.
+## Why there is no CPU profile
+
+v0.1 and v0.2 served one through pprof-rs, and it was most of these apps'
+memory. pprof-rs preallocates a 16–22 MB sample table so its signal handler
+never allocates, rebuilds it after every profile and keeps it; Alloy profiles
+back to back, so it was always held, and the churn of replacing it every 15
+seconds left jemalloc sitting on several times that again. echo, which runs
+in 8 MB, settled at 50 MB, and list at 80. For apps with a handful of users a
+flame graph was not worth that, so v0.3 dropped it. The Pi's kernel has no
+BTF, which rules out profiling from outside with Alloy's eBPF profiler.

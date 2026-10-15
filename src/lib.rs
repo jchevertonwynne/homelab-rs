@@ -15,7 +15,7 @@
 //! | [`http`] | wires the two middlewares onto a router, with net/http's 404 and 405 |
 //! | [`serve`] | an HTTP/1 server with timeouts, and shutdown on SIGINT/SIGTERM |
 //! | [`etag`] | strong ETags over embedded assets, so a repeat request costs a 304 |
-//! | [`profiling`] | pprof CPU and heap profiles on their own listener, for Alloy |
+//! | [`profiling`] | a pprof heap profile on its own listener, for Alloy |
 //!
 //! With the default `jemalloc` feature, on Linux, linking this crate also makes
 //! jemalloc the process allocator: that is what the heap profile and the
