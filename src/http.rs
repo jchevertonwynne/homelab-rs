@@ -10,7 +10,7 @@
 use axum::Router;
 use axum::extract::{MatchedPath, Request};
 use axum::http::{HeaderValue, Method, StatusCode, header};
-use axum::middleware::{from_fn, map_response};
+use axum::middleware::{from_fn_with_state, map_response};
 use axum::response::{IntoResponse, Response};
 
 /// Every app's router goes out through this: net/http's 404, inside the
@@ -24,10 +24,58 @@ pub fn instrument(router: Router) -> Router {
     crate::metrics::register();
     let inner = router
         .fallback(not_found)
-        .layer(from_fn(crate::metrics::middleware))
-        .layer(from_fn(crate::trace::middleware));
-    // axum sets a 405's Allow header after every route layer has run, so the
-    // rewrite into net/http's shape has to wrap the whole router from outside.
+        .layer(from_fn_with_state(
+            crate::metrics::Labels::plain(),
+            crate::metrics::middleware,
+        ))
+        .layer(from_fn_with_state(None, crate::trace::middleware));
+    shape_405(inner)
+}
+
+/// For an app that serves most of its routes behind a wrapper — an
+/// authentication layer — with a few unwrapped routes beside them: Go's
+/// `mux.Handle("/", authenticate(app))` next to `mux.Handle("GET /healthz",
+/// …)`, instrumented with `metrics.Instrument(mux, metrics.WithRouters(app),
+/// metrics.WithExcludedRoutes(…))`.
+///
+/// `outer` holds the unwrapped routes and `app` everything else; `app` is
+/// served for any request `outer` has no route for. Bring `app` with its own
+/// fallback ([`not_found`]) and its wrapper already applied, so the wrapper
+/// covers unknown paths as well.
+///
+/// The labels follow the Go version exactly, quirks included, because the
+/// series are what carry over:
+///
+/// - **metrics** label by `app`'s matched pattern, then `outer`'s, and
+///   otherwise `/` — the pattern the catch-all was registered under — never
+///   `unmatched`. The label is fixed before the wrapper runs, so a request the
+///   wrapper refuses is still counted under the route it was for.
+/// - **spans** are named from `outer` alone: `GET /healthz`, and `GET /` for
+///   everything in `app`. otelhttp only ever saw the outer mux's pattern,
+///   because the wrapper handed the inner mux a copy of the request.
+/// - routes in `excluded` (`"GET /live"`) are left out of the metrics
+///   entirely: a stream open for hours would make the histogram and the
+///   in-flight gauge lie for as long as it lasted.
+pub fn instrument_layered(outer: Router, app: Router, excluded: &[&str]) -> Router {
+    crate::metrics::register();
+    let labels = crate::metrics::Labels::layered(excluded);
+    // Outermost on app, so it runs before app's own wrapper.
+    let app = app.layer(from_fn_with_state(
+        labels.clone(),
+        crate::metrics::middleware,
+    ));
+    let inner = outer
+        // route_layer: outer's own routes only. A request handed to app is
+        // counted there, once.
+        .route_layer(from_fn_with_state(labels, crate::metrics::middleware))
+        .fallback_service(app)
+        .layer(from_fn_with_state(Some("/"), crate::trace::middleware));
+    shape_405(inner)
+}
+
+/// axum sets a 405's Allow header after every route layer has run, so the
+/// rewrite into net/http's shape has to wrap the whole router from outside.
+fn shape_405(inner: Router) -> Router {
     Router::new()
         .fallback_service(inner)
         .layer(map_response(method_not_allowed))
@@ -110,6 +158,26 @@ pub async fn not_found(req: Request) -> Response {
         return redirect(req.method(), &location);
     }
     plain(StatusCode::NOT_FOUND, "404 page not found\n")
+}
+
+/// `http.NotFound` with no path cleaning: for a handler that has already
+/// decided the thing is not there.
+pub fn plain_not_found() -> Response {
+    plain(StatusCode::NOT_FOUND, "404 page not found\n")
+}
+
+/// `http.Error`'s shape for any status and message: text, a trailing newline,
+/// and `nosniff`.
+pub fn error(status: StatusCode, msg: &str) -> Response {
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        format!("{msg}\n"),
+    )
+        .into_response()
 }
 
 /// `http.Redirect` with 307: a short HTML body for GET and HEAD, none

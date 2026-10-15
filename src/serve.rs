@@ -25,10 +25,18 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// SIGKILL; this is what keeps the drain inside that window.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What to do between the signal and the drain. For anything holding a
-/// response open that the drain would otherwise wait out — an SSE hub, whose
-/// streams only end when it closes.
-pub type PreShutdown = Box<dyn FnOnce() + Send>;
+/// What [`run_with`] can be told beyond the address and router.
+#[derive(Default)]
+pub struct Options {
+    /// Added to the `"listening"` line, for whatever the app wants on record
+    /// at startup (a database path, say). The address is always included.
+    pub log_attrs: Vec<(&'static str, String)>,
+    /// Runs after the signal arrives but before the drain. For anything
+    /// holding a response open that the drain would otherwise wait out — an
+    /// SSE hub, whose streams only end when it closes. Left running, every
+    /// rollout burns the whole shutdown timeout waiting for clients to leave.
+    pub pre_shutdown: Option<Box<dyn FnOnce() + Send>>,
+}
 
 /// Serves `router` on `addr` (Go's spelling: `:8092` is every interface) until
 /// SIGINT or SIGTERM, then drains in-flight requests.
@@ -37,12 +45,14 @@ pub type PreShutdown = Box<dyn FnOnce() + Send>;
 /// worth exiting non-zero over: Kubernetes should restart a pod that cannot
 /// serve. Anything to flush on the way out goes after this returns.
 pub async fn run(addr: &str, router: Router) -> Result<()> {
-    run_with(addr, router, None).await
+    run_with(addr, router, Options::default()).await
 }
 
-pub async fn run_with(addr: &str, router: Router, pre_shutdown: Option<PreShutdown>) -> Result<()> {
+pub async fn run_with(addr: &str, router: Router, opts: Options) -> Result<()> {
     let listener = bind(addr).await?;
-    tracing::info!(addr, "listening");
+    let mut attrs = vec![("addr", addr.to_string())];
+    attrs.extend(opts.log_attrs);
+    crate::logging::info_with("listening", &attrs);
 
     let graceful = GracefulShutdown::new();
     let mut stop = std::pin::pin!(stopped());
@@ -86,7 +96,7 @@ pub async fn run_with(addr: &str, router: Router, pre_shutdown: Option<PreShutdo
     drop(listener);
 
     tracing::info!("shutting down");
-    if let Some(f) = pre_shutdown {
+    if let Some(f) = opts.pre_shutdown {
         f();
     }
     tokio::time::timeout(SHUTDOWN_TIMEOUT, graceful.shutdown())

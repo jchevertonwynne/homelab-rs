@@ -8,17 +8,18 @@ them by name and a renamed one is an empty panel rather than an error.
 
 | | |
 |---|---|
+| `access` | the Cloudflare Access identity header, and the hostname's allowlist |
 | `flags` | Go `flag`-style arguments (`-addr :8092`), so a Deployment's `args` carry over unchanged |
 | `logging` | slog-shaped JSON on stdout, with the active span's `trace_id` and `span_id` |
 | `trace` | OTLP/gRPC span export, an otelhttp-shaped server span per request, and `op` for child spans |
 | `metrics` | `http_request_duration_seconds` and `http_requests_in_flight`, plus `tokio_*`, `jemalloc_*` and `process_*` |
-| `http` | wires the middleware onto a router, with net/http's 404, 405 and path-cleaning redirect |
+| `http` | wires the middleware onto a router — plainly, or layered for an app behind an auth wrapper — with net/http's 404, 405 and path-cleaning redirect |
 | `serve` | an HTTP/1 server with timeouts, and shutdown on SIGINT/SIGTERM |
 | `etag` | strong ETags over embedded assets, with ServeContent's conditional and range handling |
 | `profiling` | pprof CPU and heap profiles on their own listener, for Alloy's pyroscope.scrape |
 
 ```toml
-homelab = { git = "https://github.com/jchevertonwynne/homelab-rs", tag = "v0.1.0" }
+homelab = { git = "https://github.com/jchevertonwynne/homelab-rs", tag = "v0.2.0" }
 ```
 
 ```rust
@@ -29,6 +30,17 @@ let app = homelab::http::instrument(Router::new().route("/", get(handler)));
 homelab::serve::run(":8092", app).await?;
 tracing.shutdown().await;
 ```
+
+## An app behind a wrapper
+
+`http::instrument_layered(outer, app, excluded)` is for the Go shape
+`mux.Handle("/", authenticate(app))` beside a few unwrapped routes
+(`/healthz`, `/metrics`), instrumented with `metrics.WithRouters(app)` and
+`WithExcludedRoutes`. Metrics label by the app's matched pattern even when the
+wrapper refuses the request, and by `/` for anything no route matched; spans
+are named from the outer router, so every app route is `GET /`, `POST /` —
+which is what otelhttp recorded for those apps. Excluded routes (long-lived
+streams) never touch the histogram or the in-flight gauge.
 
 ## The contract with homelab-go
 

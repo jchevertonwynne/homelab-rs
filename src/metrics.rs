@@ -16,10 +16,10 @@
 //! kept: the process collector reads the same /proc fields client_golang's
 //! does.
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::http::header;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -61,12 +61,44 @@ pub(crate) fn register() {
     crate::alloc::register();
 }
 
+/// How the middleware names what it sees. See `http::instrument_layered` for
+/// why a layered router labels differently from a plain one.
+#[derive(Clone)]
+pub(crate) struct Labels {
+    /// The route label when nothing matched.
+    unmatched: &'static str,
+    /// Full patterns ("GET /live") never recorded at all.
+    excluded: Arc<[String]>,
+}
+
+impl Labels {
+    pub(crate) fn plain() -> Self {
+        Labels {
+            unmatched: "unmatched",
+            excluded: Arc::from([]),
+        }
+    }
+
+    pub(crate) fn layered(excluded: &[&str]) -> Self {
+        Labels {
+            unmatched: "/",
+            excluded: excluded.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+}
+
 /// Labels each request by its ServeMux-style pattern rather than its raw path
-/// — one series per route, not one per row ever created. Anything no route
-/// matched is `unmatched`.
-pub(crate) async fn middleware(req: Request, next: Next) -> Response {
+/// — one series per route, not one per row ever created.
+pub(crate) async fn middleware(State(labels): State<Labels>, req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let route = Route::of(&req);
+    // The route has to be known before the gauge is touched, so an excluded
+    // route never increments it.
+    if let Some(pattern) = route.pattern(&method)
+        && labels.excluded.contains(&pattern)
+    {
+        return next.run(req).await;
+    }
 
     IN_FLIGHT.inc();
     // A guard rather than a decrement after the await: a client that hangs up
@@ -81,7 +113,7 @@ pub(crate) async fn middleware(req: Request, next: Next) -> Response {
     DURATION
         .with_label_values(&[
             method.as_str(),
-            route.as_deref().unwrap_or("unmatched"),
+            route.as_deref().unwrap_or(labels.unmatched),
             status.as_str(),
         ])
         .observe(elapsed);

@@ -59,13 +59,6 @@ impl<S: Subscriber> Layer<S> for SlogJson {
 fn render(event: &Event<'_>, now: &jiff::Zoned) -> String {
     let mut fields = Fields::default();
     event.record(&mut fields);
-
-    let mut out = String::with_capacity(160);
-    out.push_str("{\"time\":");
-    push_json_str(&mut out, &timestamp(now));
-    out.push_str(",\"level\":");
-    push_json_str(&mut out, level(event.metadata().level()));
-    out.push_str(",\"msg\":");
     // The OpenTelemetry SDK logs events with a name and no message
     // ("BatchSpanProcessor.ExportError"); the name is the only thing that says
     // what the line is about, so it stands in.
@@ -79,8 +72,19 @@ fn render(event: &Event<'_>, now: &jiff::Zoned) -> String {
     } else {
         fields.msg.clone()
     };
-    push_json_str(&mut out, &msg);
-    for (key, value) in &fields.attrs {
+    line(level(event.metadata().level()), &msg, &fields.attrs, now)
+}
+
+/// One record from its parts, with each attr already encoded as JSON.
+fn line(level: &str, msg: &str, attrs: &[(&str, String)], now: &jiff::Zoned) -> String {
+    let mut out = String::with_capacity(160);
+    out.push_str("{\"time\":");
+    push_json_str(&mut out, &timestamp(now));
+    out.push_str(",\"level\":");
+    push_json_str(&mut out, level);
+    out.push_str(",\"msg\":");
+    push_json_str(&mut out, msg);
+    for (key, value) in attrs {
         out.push(',');
         push_json_str(&mut out, key);
         out.push(':');
@@ -101,6 +105,24 @@ fn render(event: &Event<'_>, now: &jiff::Zoned) -> String {
     }
     out.push('}');
     out
+}
+
+/// An INFO record whose string fields are only known at runtime — the
+/// `"listening"` line, which an app extends with its own attributes. tracing's
+/// macros need their field names at compile time; this writes the same shape.
+pub fn info_with(msg: &str, attrs: &[(&str, String)]) {
+    let encoded: Vec<(&str, String)> = attrs
+        .iter()
+        .map(|(k, v)| {
+            (
+                *k,
+                serde_json::to_string(v).expect("a str always serialises"),
+            )
+        })
+        .collect();
+    let mut out = line("INFO", msg, &encoded, &jiff::Zoned::now());
+    out.push('\n');
+    let _ = std::io::stdout().lock().write_all(out.as_bytes());
 }
 
 /// slog's names. tracing has a TRACE level slog lacks; it is filtered out

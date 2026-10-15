@@ -7,6 +7,7 @@
 //!
 //! | | |
 //! |---|---|
+//! | [`access`] | the Cloudflare Access identity header, and the hostname's allowlist |
 //! | [`flags`] | Go `flag`-style arguments, so a Deployment's `args` carry over unchanged |
 //! | [`logging`] | slog-shaped JSON on stdout, with the active span's trace ids |
 //! | [`trace`] | OTLP/gRPC span export and an otelhttp-shaped server span per request |
@@ -20,6 +21,7 @@
 //! jemalloc the process allocator: that is what the heap profile and the
 //! `jemalloc_*` series read. The `tokio_*` runtime series need nothing extra.
 
+pub mod access;
 #[cfg(all(feature = "jemalloc", target_os = "linux"))]
 mod alloc;
 pub mod etag;

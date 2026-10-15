@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 
 use anyhow::{Context as _, Result};
 use axum::body::HttpBody as _;
-use axum::extract::{ConnectInfo, Request};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, Method, Version, header};
 use axum::middleware::Next;
 use axum::response::Response;
@@ -74,7 +74,15 @@ impl Tracing {
 
 /// A server span around every request, as `otelhttp.NewHandler` gives one.
 /// Probes and scrapes are included, as they are in the Go apps.
-pub(crate) async fn middleware(req: Request, next: Next) -> Response {
+///
+/// `unrouted` is the path a request no route matched is named with: None for
+/// a plain router (the span is named by its method alone), `/` for a layered
+/// one, where the outer mux's catch-all matched it.
+pub(crate) async fn middleware(
+    State(unrouted): State<Option<&'static str>>,
+    req: Request,
+    next: Next,
+) -> Response {
     let parent = global::get_text_map_propagator(|p| p.extract(&Headers(req.headers())));
     let method = req.method().clone();
     let route = Route::of(&req);
@@ -92,9 +100,9 @@ pub(crate) async fn middleware(req: Request, next: Next) -> Response {
     let span = cx.span();
     let status = res.status();
     let route = route.settle(status);
-    if let Some(path) = &route.path {
-        // Name only: otelhttp reads the pattern for http.route before the mux
-        // has set it, so the Go spans never carried that attribute.
+    // Name only: otelhttp reads the pattern for http.route before the mux has
+    // set it, so the Go spans never carried that attribute.
+    if let Some(path) = route.path.as_deref().or(unrouted) {
         span.update_name(span_name(&method, Some(path)));
     }
     if let Some(size) = res.body().size_hint().exact().filter(|&n| n > 0) {
