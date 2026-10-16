@@ -1,20 +1,15 @@
 //! The Prometheus `/metrics` endpoint, and the middleware recording request
 //! latency and concurrency.
 //!
-//! The series names, label names and label order are a stable contract shared
-//! with homelab-go. A dashboard or alert built against them keeps working;
-//! renaming one yields an empty panel rather than an error, which is a silent
-//! failure. So `status` is a string label holding the numeric code and is not
-//! named `code`, the labels stay in method/route/status order, and the buckets
-//! stay `prometheus.DefBuckets` — which `prometheus::DEFAULT_BUCKETS` is,
-//! value for value.
+//! The series names, label names and label order are a contract with the
+//! homelab dashboards and alerts, which read them by name: renaming one gives
+//! an empty panel rather than an error. `status` is a string label holding the
+//! numeric code, the labels are method/route/status in that order, and the
+//! buckets are `prometheus::DEFAULT_BUCKETS`.
 //!
-//! The Go runtime's `go_*` series have no direct equivalent. The nearest are
-//! the tokio runtime's `tokio_*` (tasks for goroutines, worker busy time for
-//! the scheduler) and, with jemalloc, `jemalloc_*` for the `go_memstats_*`
-//! heap figures; both are refreshed at each scrape. The `process_*` series are
-//! kept: the process collector reads the same /proc fields client_golang's
-//! does.
+//! Alongside them, refreshed at each scrape: the tokio runtime's `tokio_*`,
+//! jemalloc's `jemalloc_*` when it is the allocator, and the process
+//! collector's `process_*`.
 
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -24,8 +19,6 @@ use axum::http::header;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use prometheus::{Encoder, HistogramOpts, HistogramVec, IntGauge, Opts, TextEncoder};
-
-use crate::http::Route;
 
 static DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     let h = HistogramVec::new(
@@ -51,8 +44,8 @@ static IN_FLIGHT: LazyLock<IntGauge> = LazyLock::new(|| {
     g
 });
 
-/// Registers both series now rather than on the first request, so the gauge
-/// reads 0 from the first scrape as client_golang's does.
+/// Registers the series now rather than on the first request, so the gauge
+/// reads 0 from the first scrape.
 pub(crate) fn register() {
     LazyLock::force(&DURATION);
     LazyLock::force(&IN_FLIGHT);
@@ -61,42 +54,27 @@ pub(crate) fn register() {
     crate::alloc::register();
 }
 
-/// How the middleware names what it sees. See `http::instrument_layered` for
-/// why a layered router labels differently from a plain one.
+/// Routes the middleware leaves out, by label ("GET /live").
 #[derive(Clone)]
 pub(crate) struct Labels {
-    /// The route label when nothing matched.
-    unmatched: &'static str,
-    /// Full patterns ("GET /live") never recorded at all.
     excluded: Arc<[String]>,
 }
 
 impl Labels {
-    pub(crate) fn plain() -> Self {
+    pub(crate) fn new(excluded: &[&str]) -> Self {
         Labels {
-            unmatched: "unmatched",
-            excluded: Arc::from([]),
-        }
-    }
-
-    pub(crate) fn layered(excluded: &[&str]) -> Self {
-        Labels {
-            unmatched: "/",
             excluded: excluded.iter().map(|s| s.to_string()).collect(),
         }
     }
 }
 
-/// Labels each request by its ServeMux-style pattern rather than its raw path
-/// — one series per route, not one per row ever created.
+/// Records each request's latency under the route it matched, and counts it
+/// in flight while it runs.
 pub(crate) async fn middleware(State(labels): State<Labels>, req: Request, next: Next) -> Response {
     let method = req.method().clone();
-    let route = Route::of(&req);
-    // The route has to be known before the gauge is touched, so an excluded
-    // route never increments it.
-    if let Some(pattern) = route.pattern(&method)
-        && labels.excluded.contains(&pattern)
-    {
+    let route = crate::http::route(&req);
+    // Decided before the gauge is touched, so an excluded route never moves it.
+    if route.as_ref().is_some_and(|r| labels.excluded.contains(r)) {
         return next.run(req).await;
     }
 
@@ -106,17 +84,13 @@ pub(crate) async fn middleware(State(labels): State<Labels>, req: Request, next:
     let _in_flight = Decrement;
     let start = Instant::now();
     let res = next.run(req).await;
-    let elapsed = start.elapsed().as_secs_f64();
-
-    let status = res.status();
-    let route = route.settle(status).pattern(&method);
     DURATION
         .with_label_values(&[
             method.as_str(),
-            route.as_deref().unwrap_or(labels.unmatched),
-            status.as_str(),
+            route.as_deref().unwrap_or("unmatched"),
+            res.status().as_str(),
         ])
-        .observe(elapsed);
+        .observe(start.elapsed().as_secs_f64());
     res
 }
 

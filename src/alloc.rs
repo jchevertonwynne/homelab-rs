@@ -2,9 +2,8 @@
 //! own accounting exported as metrics.
 //!
 //! Linking this crate is enough: the `#[global_allocator]` below applies to
-//! the whole binary. It exists for two signals the Go apps had for free — a
-//! heap profile, and `go_memstats_*`'s view of how much the heap holds versus
-//! how much the process has mapped — and because musl's own allocator, which a
+//! the whole binary. It exists for two signals — a heap profile, and how much
+//! the heap holds against how much the process keeps resident — and because musl's own allocator, which a
 //! static binary otherwise gets, is slow under contention.
 //!
 //! The sampling interval is 2^19 bytes (512 KiB): on average one allocation in
@@ -51,7 +50,7 @@ pub static MALLOC_CONF: MallocConf =
     MallocConf(c"prof:true,prof_active:false,lg_prof_sample:19".as_ptr());
 
 /// What jemalloc says it holds, refreshed at each scrape. `allocated` is what
-/// the program asked for and still holds — the Go heap's `inuse` — and
+/// the program asked for and still holds — the live heap — and
 /// `resident` is what that costs in physical memory, which is the number the
 /// container's memory limit is measured against.
 struct Gauges {
@@ -153,7 +152,7 @@ pub(crate) fn refresh() {
 }
 
 /// The heap profile in pprof's format, gzipped: the live sampled allocations
-/// as `inuse_space`, which is the sample type Pyroscope files Go's heap
+/// as `inuse_space`, which is the sample type Pyroscope files heap
 /// profile under. Blocking — it writes a dump to the temp directory and reads
 /// it back.
 pub(crate) fn heap_profile() -> Result<Vec<u8>, String> {

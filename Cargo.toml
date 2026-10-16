@@ -1,6 +1,6 @@
 [package]
 name = "homelab"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Observability and serving for the homelab's axum services, matching homelab-go's signals"
 publish = false
@@ -45,5 +45,6 @@ default = ["jemalloc"]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "dep:jemalloc_pprof"]
 
 [dev-dependencies]
+opentelemetry_sdk = { version = "0.33", features = ["testing"] }
 http-body-util = "0.1"
 tokio = { version = "1", features = ["test-util"] }

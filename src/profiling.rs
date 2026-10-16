@@ -8,7 +8,7 @@
 //!
 //! With jemalloc (the default feature, Linux only) the heap profile is served
 //! at both `/debug/pprof/heap` and `/debug/pprof/allocs`. It holds only the
-//! live sampled allocations (`inuse_space`), not Go's cumulative alloc counts,
+//! live sampled allocations (`inuse_space`), not cumulative allocation counts,
 //! so it answers "what is holding memory now" and not "what churns".
 //!
 //! **There is no CPU profile.** pprof-rs served one, and cost more than these
@@ -16,8 +16,9 @@
 //! that it rebuilds after every profile and keeps, and with Alloy profiling
 //! back to back the churn left jemalloc holding several times that — an app
 //! that runs in 8 MB settled at 50–80 MB. Alloy's requests for the CPU profile,
-//! and for Go's goroutine, mutex and block profiles, get a 404 here; the
-//! `tokio_*` series are the nearest signal for the last three.
+//! and for the goroutine, mutex and block profiles Go programs serve, get a
+//! 404 here — though Alloy is configured to ask a pod annotated
+//! `pyroscope.io/profiles: "memory"` for its heap alone.
 //!
 //! The heap dump goes through a temporary file, so it needs a writable temp
 //! directory — which a scratch image with a read-only root does not have.
@@ -28,25 +29,20 @@ use axum::routing::get;
 
 /// Serves the profiles on `addr`. A bind failure is logged, not fatal —
 /// diagnostics are not worth taking the app down for.
-pub fn spawn(addr: String) {
+pub fn spawn(addr: std::net::SocketAddr) {
     if let Err(err) = temp_dir_writable() {
-        tracing::error!(addr, error = err, "profiling server");
+        tracing::error!(%addr, error = err, "profiling server");
     }
     tokio::spawn(async move {
-        let target = if addr.starts_with(':') {
-            format!("0.0.0.0{addr}")
-        } else {
-            addr.clone()
-        };
-        let listener = match tokio::net::TcpListener::bind(&target).await {
+        let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(err) => {
-                tracing::error!(addr, error = %err, "profiling server");
+                tracing::error!(%addr, error = %err, "profiling server");
                 return;
             }
         };
         if let Err(err) = axum::serve(listener, router()).await {
-            tracing::error!(addr, error = %err, "profiling server");
+            tracing::error!(%addr, error = %err, "profiling server");
         }
     });
 }

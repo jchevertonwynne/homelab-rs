@@ -1,6 +1,5 @@
-//! `instrument_layered` labels requests as Go's metrics.Instrument did with
-//! WithRouters(app) and WithExcludedRoutes — the shape list has: probes
-//! beside an authenticated app, with its live streams kept out.
+//! `instrument_layered`, in the shape list has: probes beside an
+//! authenticated app, with its live stream kept out of the metrics.
 
 use axum::Router;
 use axum::body::Body;
@@ -12,8 +11,8 @@ use axum::routing::{get, post};
 use http_body_util::BodyExt as _;
 use tower::ServiceExt as _;
 
-/// Refuses anything without a `x-user` header, as list's authenticate does
-/// without the Access header.
+/// Refuses anything without an `x-user` header, as an authentication layer
+/// refuses a request with no identity.
 async fn auth(req: Request, next: Next) -> Response {
     if req.headers().contains_key("x-user") {
         next.run(req).await
@@ -32,7 +31,7 @@ fn app() -> Router {
         )
         .route("/lcollections", post(|| async { "made" }))
         .route("/llive", get(|| async { "stream" }))
-        .fallback(homelab::http::not_found)
+        .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(from_fn(auth));
     homelab::http::instrument_layered(outer, app, &["GET /llive"])
 }
@@ -64,7 +63,7 @@ async fn metrics() -> String {
 }
 
 #[tokio::test]
-async fn labels_as_go_did_with_routers_and_exclusions() {
+async fn labels_by_the_route_matched_in_whichever_router_served_it() {
     assert_eq!(send("GET", "/lhealthz", false).await, StatusCode::OK);
     assert_eq!(send("GET", "/", true).await, StatusCode::OK);
     assert_eq!(send("GET", "/lcollections/7", true).await, StatusCode::OK);
@@ -73,9 +72,7 @@ async fn labels_as_go_did_with_routers_and_exclusions() {
         send("GET", "/lcollections/7", false).await,
         StatusCode::FORBIDDEN
     );
-    // Unknown behind the wrapper: Go's catch-all pattern, never "unmatched".
     assert_eq!(send("GET", "/lnope", true).await, StatusCode::NOT_FOUND);
-    // A 405 inside app has no app pattern either.
     assert_eq!(
         send("PUT", "/lcollections/7", true).await,
         StatusCode::METHOD_NOT_ALLOWED
@@ -86,11 +83,11 @@ async fn labels_as_go_did_with_routers_and_exclusions() {
     let body = metrics().await;
     for series in [
         r#"{method="GET",route="GET /lhealthz",status="200"}"#,
-        r#"{method="GET",route="GET /{$}",status="200"}"#,
+        r#"{method="GET",route="GET /",status="200"}"#,
         r#"{method="GET",route="GET /lcollections/{collection}",status="200"}"#,
         r#"{method="GET",route="GET /lcollections/{collection}",status="403"}"#,
-        r#"{method="GET",route="/",status="404"}"#,
-        r#"{method="PUT",route="/",status="405"}"#,
+        r#"{method="GET",route="unmatched",status="404"}"#,
+        r#"{method="PUT",route="PUT /lcollections/{collection}",status="405"}"#,
         r#"{method="POST",route="POST /lcollections",status="200"}"#,
     ] {
         assert!(
@@ -102,5 +99,4 @@ async fn labels_as_go_did_with_routers_and_exclusions() {
         !body.contains("llive"),
         "an excluded route was recorded:\n{body}"
     );
-    assert!(!body.contains("unmatched"), "{body}");
 }

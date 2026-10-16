@@ -1,4 +1,4 @@
-//! The identity Cloudflare Access puts on a request — homelab-go's `access`.
+//! The identity Cloudflare Access puts on a request.
 //!
 //! It deliberately decides nothing. There is no middleware here and nothing
 //! returns a 403, because the interesting half of an authentication check is
@@ -34,7 +34,7 @@ pub fn normalize_email(s: &str) -> String {
 /// is missing and never in preference to it: an app behind Access must not be
 /// able to have its caller overridden by its own flags.
 pub fn email(headers: &HeaderMap, dev_user: &str) -> Option<String> {
-    // The first value, as Go's Header.Get gives it.
+    // The first value, should a client send several.
     let from_header = headers
         .get(EMAIL_HEADER)
         .map(|v| normalize_email(&String::from_utf8_lossy(v.as_bytes())))

@@ -2,18 +2,17 @@
 //! forwards them to Grafana Cloud Tempo. Always sampled — Alloy is the only hop
 //! and the traffic here is nowhere near worth trimming.
 //!
-//! The request span is shaped as otelhttp shapes it, because the dashboards
-//! query spans by name and `resource.service.name`: named `"GET /{$}"` once the
-//! route is known and just `"GET"` when nothing matched, a server span, an
-//! error only for a 5xx, with the same semantic-convention attributes. A W3C
-//! `traceparent` on the request continues its trace rather than starting a new
-//! one.
+//! The request span follows OpenTelemetry's HTTP semantic conventions: a
+//! server span named for the route it matched (`"GET /entries/{id}"`), or the
+//! method alone when nothing matched, an error only for a 5xx, and the
+//! standard request and response attributes. A W3C `traceparent` on the
+//! request continues its trace rather than starting a new one.
 
 use std::net::SocketAddr;
 
 use anyhow::{Context as _, Result};
 use axum::body::HttpBody as _;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{ConnectInfo, Request};
 use axum::http::{HeaderMap, Method, Version, header};
 use axum::middleware::Next;
 use axum::response::Response;
@@ -25,8 +24,6 @@ use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
-
-use crate::http::Route;
 
 /// What [`init`] started. Shut it down after the server stops, or the last
 /// batch of spans is dropped.
@@ -72,20 +69,17 @@ impl Tracing {
     }
 }
 
-/// A server span around every request, as `otelhttp.NewHandler` gives one.
-/// Probes and scrapes are included, as they are in the Go apps.
-///
-/// `unrouted` is the path a request no route matched is named with: None for
-/// a plain router (the span is named by its method alone), `/` for a layered
-/// one, where the outer mux's catch-all matched it.
-pub(crate) async fn middleware(
-    State(unrouted): State<Option<&'static str>>,
-    req: Request,
-    next: Next,
-) -> Response {
+/// A server span around every request, probes and scrapes included, named
+/// for the route it matched — `"GET /entries/{id}"` — or for its method alone
+/// when none did.
+pub(crate) async fn middleware(mut req: Request, next: Next) -> Response {
     let parent = global::get_text_map_propagator(|p| p.extract(&Headers(req.headers())));
     let method = req.method().clone();
-    let route = Route::of(&req);
+    // The outer router's own match, if it has one; a router nested in its
+    // fallback fills in the slot instead (see http::instrument_layered).
+    let matched = crate::http::route(&req);
+    let slot = crate::http::RouteSlot::default();
+    req.extensions_mut().insert(slot.clone());
 
     let tracer = global::tracer("homelab");
     let span = tracer
@@ -98,16 +92,15 @@ pub(crate) async fn middleware(
     let res = next.run(req).with_context(cx.clone()).await;
 
     let span = cx.span();
-    let status = res.status();
-    let route = route.settle(status);
-    // Name only: otelhttp reads the pattern for http.route before the mux has
-    // set it, so the Go spans never carried that attribute.
-    if let Some(path) = route.path.as_deref().or(unrouted) {
+    if let Some(route) = matched.or_else(|| slot.take()) {
+        let path = route.split_once(' ').map_or(route.as_str(), |(_, p)| p);
+        span.set_attribute(KeyValue::new("http.route", path.to_string()));
         span.update_name(span_name(&method, Some(path)));
     }
     if let Some(size) = res.body().size_hint().exact().filter(|&n| n > 0) {
         span.set_attribute(KeyValue::new("http.response.body.size", size as i64));
     }
+    let status = res.status();
     span.set_attribute(KeyValue::new(
         "http.response.status_code",
         i64::from(status.as_u16()),
@@ -146,7 +139,7 @@ fn span_name(method: &Method, path: Option<&str>) -> String {
     }
 }
 
-/// otelhttp's request attributes, in its order.
+/// The semantic-convention request attributes.
 fn request_attrs(req: &Request) -> Vec<KeyValue> {
     let host = req
         .uri()
@@ -188,8 +181,8 @@ fn request_attrs(req: &Request) -> Vec<KeyValue> {
     {
         attrs.push(KeyValue::new("user_agent.original", ua));
     }
-    // The first X-Forwarded-For entry, untrimmed, else the peer — otelhttp's
-    // order. Behind cloudflared that is cloudflared's view of the visitor.
+    // The first X-Forwarded-For entry, else the peer. Behind cloudflared that
+    // is cloudflared's view of the visitor.
     let client = header_str(req.headers(), "x-forwarded-for")
         .map(|xff| xff.split(',').next().unwrap_or_default().to_string())
         .filter(|s| !s.is_empty())
@@ -204,7 +197,7 @@ fn request_attrs(req: &Request) -> Vec<KeyValue> {
     attrs
 }
 
-/// Go's `r.URL.Path` is the decoded path, so the attribute is too.
+/// url.path is the decoded path.
 pub(crate) fn decoded_path(raw: &str) -> String {
     percent_encoding::percent_decode_str(raw)
         .decode_utf8_lossy()
@@ -228,7 +221,7 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
 }
 
-/// `host[:port]` or `[v6]:port`, as Go's SplitHostPort reads a Host header.
+/// A Host header's `host[:port]` or `[v6]:port`.
 fn split_host_port(hostport: &str) -> (String, Option<u16>) {
     if let Some(rest) = hostport.strip_prefix('[')
         && let Some((host, after)) = rest.split_once(']')
@@ -255,7 +248,7 @@ impl Extractor for Headers<'_> {
 }
 
 /// Runs `fut` inside a child span of the current one, recording its error on
-/// the span — `tracing.Op` from homelab-go. Wrapping a store method's body this
+/// the span. Wrapping a store method's body this
 /// way makes a slow query its own span rather than time folded into the
 /// handler that called it.
 pub async fn op<T, E: std::fmt::Display>(
@@ -288,8 +281,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn names_spans_as_otelhttp_does() {
-        assert_eq!(span_name(&Method::GET, Some("/{$}")), "GET /{$}");
+    fn names_spans_by_route_or_method() {
+        assert_eq!(span_name(&Method::GET, Some("/")), "GET /");
         assert_eq!(span_name(&Method::GET, None), "GET");
         let odd = Method::from_bytes(b"PROPFIND").unwrap();
         assert_eq!(span_name(&odd, Some("/x")), "HTTP /x");

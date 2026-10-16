@@ -1,6 +1,7 @@
 //! Serves a router with the timeouts every app on the cluster needs, and shuts
 //! it down on SIGTERM.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
@@ -17,9 +18,9 @@ use tower::ServiceExt as _;
 /// out headers, and enough of those exhaust the server without ever completing
 /// a request.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
-/// The longest a request may take end to end before its connection is closed
-/// — net/http's WriteTimeout, which also has the connection dropped rather
-/// than answered.
+/// The longest a request may take to produce its response before the
+/// connection is closed rather than answered. A streamed body, once started,
+/// is not bounded by it.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Kubernetes sends SIGTERM and waits terminationGracePeriodSeconds (30) before
 /// SIGKILL; this is what keeps the drain inside that window.
@@ -38,18 +39,20 @@ pub struct Options {
     pub pre_shutdown: Option<Box<dyn FnOnce() + Send>>,
 }
 
-/// Serves `router` on `addr` (Go's spelling: `:8092` is every interface) until
-/// SIGINT or SIGTERM, then drains in-flight requests.
+/// Serves `router` on `addr` until SIGINT or SIGTERM, then drains in-flight
+/// requests.
 ///
 /// An error means the listener could not be bound or the drain overran, both
 /// worth exiting non-zero over: Kubernetes should restart a pod that cannot
 /// serve. Anything to flush on the way out goes after this returns.
-pub async fn run(addr: &str, router: Router) -> Result<()> {
+pub async fn run(addr: SocketAddr, router: Router) -> Result<()> {
     run_with(addr, router, Options::default()).await
 }
 
-pub async fn run_with(addr: &str, router: Router, opts: Options) -> Result<()> {
-    let listener = bind(addr).await?;
+pub async fn run_with(addr: SocketAddr, router: Router, opts: Options) -> Result<()> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("listen on {addr}"))?;
     let mut attrs = vec![("addr", addr.to_string())];
     attrs.extend(opts.log_attrs);
     crate::logging::info_with("listening", &attrs);
@@ -80,11 +83,11 @@ pub async fn run_with(addr: &str, router: Router, opts: Options) -> Result<()> {
                         .serve_connection(TokioIo::new(stream), service);
                     let conn = graceful.watch(conn);
                     // A connection that errors (a reset, a header timeout) is
-                    // the client's business; net/http logs nothing for it either.
+                    // the client's business, not worth a log line.
                     tokio::spawn(async move { let _ = conn.await; });
                 }
-                // EMFILE and friends: net/http backs off and retries rather
-                // than giving up on the listener, and so does this.
+                // EMFILE and friends: back off and retry rather than give up
+                // on the listener.
                 Err(err) => {
                     tracing::error!(error = %err, "accept");
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -101,21 +104,7 @@ pub async fn run_with(addr: &str, router: Router, opts: Options) -> Result<()> {
     }
     tokio::time::timeout(SHUTDOWN_TIMEOUT, graceful.shutdown())
         .await
-        .map_err(|_| anyhow!("shutdown: context deadline exceeded"))
-}
-
-/// `:8092` means every IPv4 interface here. Go's means every interface, but a
-/// pod's network namespace may have IPv6 disabled, and binding `[::]` there
-/// fails where `0.0.0.0` cannot.
-async fn bind(addr: &str) -> Result<TcpListener> {
-    let target = if addr.starts_with(':') {
-        format!("0.0.0.0{addr}")
-    } else {
-        addr.to_string()
-    };
-    TcpListener::bind(&target)
-        .await
-        .with_context(|| format!("listen and serve: listen tcp {addr}"))
+        .map_err(|_| anyhow!("shutdown: open requests outlasted {SHUTDOWN_TIMEOUT:?}"))
 }
 
 /// Done when the cluster, or a Ctrl-C, asks the server to stop.

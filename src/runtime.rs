@@ -1,8 +1,8 @@
-//! The tokio runtime's own metrics: the nearest thing an async Rust process
-//! has to `go_goroutines` and the Go scheduler's view of itself.
+//! The tokio runtime's own metrics: how many tasks are alive, and how busy
+//! each worker thread is.
 //!
 //! Only the stable subset, so no app needs building with `tokio_unstable`.
-//! `tokio_alive_tasks` is the goroutine count's counterpart — a line that only
+//! `tokio_alive_tasks` is the one to watch for leaks — a line that only
 //! ever climbs is a task leak, as a climbing goroutine count was. The
 //! per-worker busy time is the share of each worker thread spent polling
 //! tasks rather than parked: a worker pinned near one second per second is a

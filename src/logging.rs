@@ -1,10 +1,10 @@
-//! The process-wide log output: one JSON object per line on stdout, shaped
-//! exactly as homelab-go's slog handler writes them, with the active span's
+//! The process-wide log output: one JSON object per line on stdout —
+//! `time`, `level`, `msg`, then the event's fields — with the active span's
 //! trace and span ids on every record logged inside a request.
 //!
 //! Alloy tails stdout into Loki and lifts two fields out of each line: `level`
-//! becomes a label (so the values must stay slog's `INFO`, `WARN`, `ERROR`,
-//! uppercase) and `trace_id` becomes structured metadata, which is what links a
+//! becomes a label (so the values must stay `INFO`, `WARN`, `ERROR`,
+//! uppercase, as the dashboards and the Loki queries spell them) and `trace_id` becomes structured metadata, which is what links a
 //! log line to its trace in Tempo. Everything else is carried through as-is.
 //!
 //! Log with the `tracing` macros: `tracing::error!(error = %err, "encode
@@ -28,22 +28,22 @@ use tracing_subscriber::layer::{Context, SubscriberExt};
 /// Must run before anything that logs; until it does, events go nowhere.
 pub fn init() {
     // The OpenTelemetry SDK narrates its own lifecycle at INFO ("Global tracer
-    // provider is set"), which the Go SDK never did; its warnings and errors —
+    // provider is set"), which is noise in Loki; its warnings and errors —
     // an export that failed — are worth keeping.
     let filter = Targets::new()
         .with_default(LevelFilter::INFO)
         .with_target("opentelemetry", LevelFilter::WARN)
         .with_target("opentelemetry_sdk", LevelFilter::WARN)
         .with_target("opentelemetry_otlp", LevelFilter::WARN);
-    let subscriber = tracing_subscriber::registry().with(filter).with(SlogJson);
+    let subscriber = tracing_subscriber::registry().with(filter).with(JsonLines);
     // Only fails if a subscriber is already installed, which means init ran
     // twice; the first one is the one that counts.
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
-struct SlogJson;
+struct JsonLines;
 
-impl<S: Subscriber> Layer<S> for SlogJson {
+impl<S: Subscriber> Layer<S> for JsonLines {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let mut line = render(event, &jiff::Zoned::now());
         line.push('\n');
@@ -90,7 +90,7 @@ fn line(level: &str, msg: &str, attrs: &[(&str, String)], now: &jiff::Zoned) -> 
         out.push(':');
         out.push_str(value);
     }
-    // After the record's own attrs, as slog.Record.AddAttrs puts them. An
+    // After the record's own attrs. An
     // absent or unsampled span yields all-zero ids, which would look like a
     // trace id and invite a Tempo lookup that can only come back empty.
     let cx = opentelemetry::Context::current();
@@ -125,8 +125,9 @@ pub fn info_with(msg: &str, attrs: &[(&str, String)]) {
     let _ = std::io::stdout().lock().write_all(out.as_bytes());
 }
 
-/// slog's names. tracing has a TRACE level slog lacks; it is filtered out
-/// before reaching here, but DEBUG is the honest name if it ever is not.
+/// The level names the `level` label is queried by. tracing's TRACE is
+/// filtered out before reaching here, but DEBUG is the honest name if it ever
+/// is not.
 fn level(level: &Level) -> &'static str {
     match *level {
         Level::ERROR => "ERROR",
@@ -136,9 +137,8 @@ fn level(level: &Level) -> &'static str {
     }
 }
 
-/// RFC 3339 with milliseconds, in the local zone, "Z" for UTC — what slog's
-/// JSON handler writes. The zone comes from TZ, so a pod that sets it logs
-/// local times, exactly as the Go apps did.
+/// RFC 3339 with milliseconds, in the local zone, "Z" for UTC. The zone comes
+/// from TZ, so a pod that sets it logs local times.
 fn timestamp(now: &jiff::Zoned) -> String {
     let base = now.strftime("%Y-%m-%dT%H:%M:%S%.3f").to_string();
     let offset = now.offset().seconds();
@@ -198,14 +198,14 @@ impl Visit for Fields {
     }
 
     fn record_f64(&mut self, field: &Field, value: f64) {
-        // NaN and infinities are not JSON; slog writes them as strings.
+        // NaN and infinities are not JSON, so they are written as strings.
         let json = serde_json::Number::from_f64(value)
             .map(|n| n.to_string())
             .unwrap_or_else(|| format!("\"{value}\""));
         self.push(field, json);
     }
 
-    /// An error is its message, as `"error", err` is in slog.
+    /// An error is its message.
     fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
         self.record_str(field, &value.to_string());
     }
@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_what_slog_writes() {
+    fn writes_one_json_line_per_event() {
         let lines = capture(|| tracing::info!(addr = ":8092", "listening"));
         assert_eq!(
             lines,
