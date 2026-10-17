@@ -72,7 +72,14 @@ place to read about why it looks the way it does. An app with no heap worth
 profiling can leave the feature off (`default-features = false`) and stay free
 of C.
 
-Heap sampling starts off and is switched on only if jemalloc was built with a
+Sampling is switched on before `main`, so the profile includes what an app
+sets up at startup, and one allocation in every 64 KiB has its stack recorded,
+enough to see a heap of a few MB. The first profile served leaves the binary's
+symbol table live for good, parsed to name the frames — up to a MB or so, more
+for a bigger binary — under `jemalloc_pprof::dump_pprof`. That is the
+profiler's, not the app's.
+
+Sampling is switched on only if jemalloc was built with a
 real unwinder. A build that lost it would otherwise walk frame pointers, which
 Rust code does not keep, and segfault on a sampled allocation. Without one the
 app logs `"heap profiling"` at ERROR and runs without a heap profile.
@@ -104,3 +111,10 @@ parser (apps use `clap`), no ServeMux route spelling (`GET /` rather than `GET
 /{$}`), no net/http 404/405 bodies or path-cleaning redirect, and real span
 names for layered apps. `serve::run` and `profiling::spawn` take a
 `SocketAddr`.
+
+## What changed in v0.4.1
+
+Heap sampling starts before `main` rather than when the router is built, and
+records one allocation in every 64 KiB rather than every 512. Before, nothing
+an app allocated at startup was ever in a profile, and most apps' profiles
+were empty.
