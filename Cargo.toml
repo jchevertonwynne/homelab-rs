@@ -1,6 +1,6 @@
 [package]
 name = "homelab"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "Observability and serving for the homelab's axum services, matching homelab-go's signals"
 publish = false
@@ -37,12 +37,21 @@ tikv-jemalloc-ctl = { version = "0.7", features = ["stats"], optional = true }
 # symbolise native addresses itself, so without it the heap flame graph is a
 # wall of hex.
 jemalloc_pprof = { version = "0.9", features = ["symbolize"], optional = true }
+# Switches the heap sampler on before main, so the profile covers what an app
+# allocates at startup; see src/alloc.rs.
+ctor = { version = "1", optional = true }
 
 [features]
 default = ["jemalloc"]
 # Off for an app that must keep the system allocator; the heap profile and
 # jemalloc_* series go with it.
-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "dep:jemalloc_pprof"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "dep:jemalloc_pprof", "dep:ctor"]
+
+# tests/heap_from_start.rs reads the profile through jemalloc_pprof's handle,
+# and jemalloc's own state.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+jemalloc_pprof = "0.9"
+tikv-jemalloc-ctl = "0.7"
 
 [dev-dependencies]
 opentelemetry_sdk = { version = "0.33", features = ["testing"] }

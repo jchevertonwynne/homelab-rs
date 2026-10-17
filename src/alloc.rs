@@ -6,16 +6,25 @@
 //! the heap holds against how much the process keeps resident — and because musl's own allocator, which a
 //! static binary otherwise gets, is slow under contention.
 //!
-//! The sampling interval is 2^19 bytes (512 KiB): on average one allocation in
-//! every 512 KiB allocated has its stack recorded. That is jemalloc's default,
-//! stated here so it is a decision rather than an accident, and cheap enough to
-//! leave on for good.
+//! The sampling interval is 2^16 bytes (64 KiB): on average one allocation in
+//! every 64 KiB allocated has its stack recorded. jemalloc's default is 512
+//! KiB, which these apps' live heaps — a few MB — fill with a handful of
+//! samples at most, often none: a profile with nothing in it. The cost of
+//! sampling is a stack walk per sample, so it scales with traffic, and these
+//! apps have little.
 //!
 //! The page size is fixed when jemalloc is compiled, not read at runtime. The
 //! image builds set it to 4 KiB, the Pi's; see the Dockerfile.
 //!
-//! Sampling starts switched off and [`register`] switches it on, and only once
-//! it has checked how this jemalloc was built to record a stack. With
+//! A heap profile reports only what was allocated while sampling was on, so it
+//! is switched on before `main`, by a constructor that runs as the process
+//! starts: switched on any later, everything an app sets up at startup — its
+//! runtime, connection pool, templates and assets, most of what it holds — is
+//! missing from the profile for as long as the process lives. Linking the
+//! crate is still all an app does.
+//!
+//! jemalloc starts with sampling off, and the constructor switches it on only
+//! once it has checked how this jemalloc was built to record a stack. With
 //! `_Unwind_Backtrace` (libgcc's interface, which Rust's own libunwind
 //! provides) it walks the binary's unwind tables, which is safe. Without it,
 //! jemalloc falls back to walking frame pointers, which Rust code does not
@@ -23,10 +32,16 @@
 //! process. An image whose build quietly lost the unwinder — which is exactly
 //! what cross-compiling with zig did until its wrapper mapped -lgcc to
 //! -lunwind — therefore gets an error line and no heap profile, rather than a
-//! crash loop.
+//! crash loop. Nothing can log before `main`, so the constructor keeps the
+//! outcome and [`register`] logs a failure.
+//!
+//! The first profile served leaves about 1 MB permanently live: the binary's
+//! symbol table, parsed to name the frames and kept for the next one. It shows
+//! up in the profile under `jemalloc_pprof::dump_pprof` and in
+//! `jemalloc_allocated_bytes`, and it is not the app's.
 
 use std::ffi::c_char;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 use prometheus::{IntGauge, Opts};
 use tikv_jemalloc_ctl::{epoch, stats};
@@ -47,7 +62,18 @@ unsafe impl Sync for MallocConf {}
 #[used]
 #[unsafe(export_name = "_rjem_malloc_conf")]
 pub static MALLOC_CONF: MallocConf =
-    MallocConf(c"prof:true,prof_active:false,lg_prof_sample:19".as_ptr());
+    MallocConf(c"prof:true,prof_active:false,lg_prof_sample:16".as_ptr());
+
+/// How switching the sampler on went, decided before `main`.
+static ACTIVATION: OnceLock<Result<(), String>> = OnceLock::new();
+
+// SAFETY: runs before main, so it must not rely on anything main sets up. It
+// uses jemalloc, which initialises itself on first use, and statics that
+// initialise lazily; it does not log or touch a runtime.
+#[ctor::ctor(unsafe)]
+fn activate_before_main() {
+    ACTIVATION.get_or_init(activate);
+}
 
 /// What jemalloc says it holds, refreshed at each scrape. `allocated` is what
 /// the program asked for and still holds — the live heap — and
@@ -98,28 +124,29 @@ static GAUGES: LazyLock<Gauges> = LazyLock::new(|| {
 
 pub(crate) fn register() {
     LazyLock::force(&GAUGES);
-    static ACTIVATE: std::sync::Once = std::sync::Once::new();
-    ACTIVATE.call_once(|| {
-        if !safe_unwinder() {
-            tracing::error!(
-                error = "jemalloc was built without an unwinder (config.prof_libgcc and config.prof_libunwind are both false); leaving heap profiling off rather than risk a crash",
-                "heap profiling"
-            );
-            return;
-        }
-        // Through jemalloc_pprof's handle rather than mallctl directly: it
-        // remembers whether it activated the profiler, and refuses to dump
-        // otherwise. try_lock because this runs inside the runtime, where a
-        // blocking lock panics; nothing else holds it this early.
-        let activated = jemalloc_pprof::PROF_CTL
-            .as_ref()
-            .ok_or_else(|| "jemalloc was not started with prof:true".to_string())
-            .and_then(|ctl| ctl.try_lock().map_err(|e| e.to_string()))
-            .and_then(|mut ctl| ctl.activate().map_err(|e| e.to_string()));
-        if let Err(err) = activated {
+    static REPORT: std::sync::Once = std::sync::Once::new();
+    REPORT.call_once(|| {
+        // get_or_init in case the constructor never ran, which would leave a
+        // late profile rather than none.
+        if let Err(err) = ACTIVATION.get_or_init(activate) {
             tracing::error!(error = err, "heap profiling");
         }
     });
+}
+
+fn activate() -> Result<(), String> {
+    if !safe_unwinder() {
+        return Err("jemalloc was built without an unwinder (config.prof_libgcc and config.prof_libunwind are both false); leaving heap profiling off rather than risk a crash".into());
+    }
+    // Through jemalloc_pprof's handle rather than mallctl directly: it
+    // remembers whether it activated the profiler, and refuses to dump
+    // otherwise. try_lock because nothing else can hold it this early, and a
+    // blocking lock would panic were this ever reached inside the runtime.
+    jemalloc_pprof::PROF_CTL
+        .as_ref()
+        .ok_or_else(|| "jemalloc was not started with prof:true".to_string())
+        .and_then(|ctl| ctl.try_lock().map_err(|e| e.to_string()))
+        .and_then(|mut ctl| ctl.activate().map_err(|e| e.to_string()))
 }
 
 /// Whether this jemalloc records stacks through a real unwinder rather than
