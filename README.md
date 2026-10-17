@@ -82,8 +82,9 @@ app logs `"heap profiling"` at ERROR and runs without a heap profile.
 The heap dump goes through a temp file, and a scratch image with a read-only
 root has nowhere to put one: mount an `emptyDir` at `/tmp`. Without it the app
 serves normally, every heap profile request fails, and the app says so at
-startup. Annotate the pod `pyroscope.io/profiles: "memory"`, so Alloy asks for
-the heap profile alone.
+startup. Annotate the pod `pyroscope.io/scrape: "true"` and
+`pyroscope.io/port` with the profiling port, and Alloy scrapes the heap
+profile from it.
 
 ## Why there is no CPU profile
 
