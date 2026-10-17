@@ -35,10 +35,11 @@
 //! crash loop. Nothing can log before `main`, so the constructor keeps the
 //! outcome and [`register`] logs a failure.
 //!
-//! The first profile served leaves about 1 MB permanently live: the binary's
-//! symbol table, parsed to name the frames and kept for the next one. It shows
-//! up in the profile under `jemalloc_pprof::dump_pprof` and in
-//! `jemalloc_allocated_bytes`, and it is not the app's.
+//! The first profile served leaves the binary's symbol table permanently live,
+//! parsed to name the frames and kept for the next one — up to a MB or so, more
+//! for a bigger binary. It shows up in the profile under
+//! `jemalloc_pprof::dump_pprof` and in `jemalloc_allocated_bytes`, and it is
+//! not the app's.
 
 use std::ffi::c_char;
 use std::sync::{LazyLock, OnceLock};
