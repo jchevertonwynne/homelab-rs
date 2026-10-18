@@ -9,21 +9,20 @@ every app emits them through here.
 |---|---|
 | `access` | the Cloudflare Access identity header, and the hostname's allowlist |
 | `logging` | JSON lines on stdout, with the active span's `trace_id` and `span_id` |
-| `trace` | OTLP/gRPC span export, a server span per request, and `op` for child spans |
+| `trace` | OTLP/gRPC span export through tracing-opentelemetry, and a server span per request |
 | `metrics` | `http_request_duration_seconds` and `http_requests_in_flight`, plus `tokio_*`, `jemalloc_*` and `process_*` |
-| `http` | wires the middleware onto a router — plainly, or layered for an app behind an auth wrapper |
+| `http` | wires the middleware onto a router — plainly, or layered for an app behind an auth wrapper — and turns a handler's panic into a counted 500 |
 | `serve` | an HTTP/1 server with timeouts, and shutdown on SIGINT/SIGTERM |
 | `etag` | strong ETags over embedded assets, so a repeat request costs a 304 |
 | `profiling` | a pprof heap profile on its own listener, for Alloy's pyroscope.scrape |
 
 ```toml
-homelab = { git = "https://github.com/jchevertonwynne/homelab-rs", tag = "v0.4.0" }
+homelab = { git = "https://github.com/jchevertonwynne/homelab-rs", tag = "v0.5.0" }
 ```
 
 ```rust
-homelab::logging::init();
+let tracing = homelab::init("echo", &args.otel_endpoint)?;
 homelab::profiling::spawn(args.pprof_addr);
-let tracing = homelab::trace::init("echo", &args.otel_endpoint)?;
 let app = homelab::http::instrument(Router::new().route("/", get(handler)));
 homelab::serve::run(args.addr, app).await?;
 tracing.shutdown().await;
@@ -49,7 +48,25 @@ what links a log line to its trace.
 **Spans.** A server span per request, named for its route (`GET
 /entries/{id}`) or its method alone when nothing matched, with the HTTP
 semantic-convention attributes; an error only for a 5xx; an incoming
-`traceparent` is continued.
+`traceparent` is continued. Beneath it, an app's own spans, which the
+dashboard's operations row finds by name prefix (`db.`, `notes.`):
+
+```rust
+#[tracing::instrument(name = "db.query", skip_all, fields(db.system = "sqlite"), err)]
+async fn query(&self) -> Result<Rows, Error> { … }
+```
+
+`name` is the span's name in Tempo, `skip_all` keeps arguments — user content —
+out of it, and `err` marks the span an error and logs the error once, at
+ERROR, under the span's name. `err` logs the error's `Display`, which for an
+`anyhow::Error` is only its outermost context. Where the caller already logs
+the error with its whole chain, leave `err` off and mark the span instead, so
+the error is logged once:
+
+```rust
+use homelab::trace::{OpenTelemetrySpanExt as _, Status};
+tracing::Span::current().set_status(Status::error(format!("{err:#}")));
+```
 
 ## An app behind a wrapper
 
@@ -118,3 +135,15 @@ Heap sampling starts before `main` rather than when the router is built, and
 records one allocation in every 64 KiB rather than every 512. Before, nothing
 an app allocated at startup was ever in a profile, and most apps' profiles
 were empty.
+
+## What changed in v0.5
+
+Spans are `tracing` spans, exported through tracing-opentelemetry, so an app
+marks a function with `#[tracing::instrument]` where it used to wrap its body
+in `trace::op`, which is gone. `homelab::init` starts logging and tracing
+together, replacing `logging::init` and `trace::init`: the span layer has to
+be in the subscriber from the start, because tracing-opentelemetry finds
+itself by downcasting the subscriber, which a layer added later cannot allow.
+A panicking handler is a 500, counted and logged, where it was a reset
+connection. The span export queue holds 256 rather than the SDK's 2048, which
+it allocated up front.
