@@ -7,8 +7,15 @@
 //! method alone when nothing matched, an error only for a 5xx, and the
 //! standard request and response attributes. A W3C `traceparent` on the
 //! request continues its trace rather than starting a new one.
+//!
+//! Every span is a `tracing` span, exported through tracing-opentelemetry: an
+//! app's own are `#[tracing::instrument]` on the functions worth seeing —
+//! `#[instrument(name = "db.query", skip_all, fields(db.system = "sqlite"),
+//! err)]` — and the dashboards read them by that name. `err` marks the span an
+//! error and logs the error once, at ERROR, named for the span.
 
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result};
 use axum::body::HttpBody as _;
@@ -16,42 +23,91 @@ use axum::extract::{ConnectInfo, Request};
 use axum::http::{HeaderMap, Method, Version, header};
 use axum::middleware::Next;
 use axum::response::Response;
-use opentelemetry::context::FutureExt as _;
+use opentelemetry::global;
 use opentelemetry::propagation::Extractor;
-use opentelemetry::trace::{SpanKind, Status, TraceContextExt, Tracer};
-use opentelemetry::{Context, KeyValue, global};
+use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
-use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider};
+use tracing::Instrument as _;
+use tracing::field::Empty;
 
-/// What [`init`] started. Shut it down after the server stops, or the last
-/// batch of spans is dropped.
+use crate::logging::Sink;
+
+/// For an app to mark its own span an error without logging, when the caller
+/// already logs it: `Span::current().set_status(Status::error(..))`.
+/// Re-exported so an app's versions cannot drift from this crate's.
+pub use opentelemetry::trace::Status;
+pub use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+/// How many finished spans wait for export at most. The SDK's default is
+/// 2048, and its queue holds a slot for each from the start — about 770 kB,
+/// the largest single thing in these apps' heaps. A batch goes every five
+/// seconds and these apps finish a few spans a second, so 256 is still far
+/// more than a batch ever holds; past it, spans are dropped and the SDK
+/// says so at WARN.
+const QUEUE: usize = 256;
+
+/// What [`crate::init`] started. Shut it down after the server stops, or the
+/// last batch of spans is dropped.
 pub struct Tracing {
     provider: Option<SdkTracerProvider>,
 }
 
-/// Points the global tracer provider at `endpoint` (host:port of Alloy's
-/// OTLP/gRPC receiver), plaintext because it never leaves the cluster network.
-/// An empty endpoint leaves the no-op tracer in place, for local dev.
-pub fn init(service: &'static str, endpoint: &str) -> Result<Tracing> {
+/// See [`crate::init`].
+pub(crate) fn init(service: &'static str, endpoint: &str) -> Result<Tracing> {
     if endpoint.is_empty() {
-        return Ok(Tracing { provider: None });
+        return Ok(start(None, Sink::Stdout));
     }
+    match provider(service, endpoint) {
+        Ok(provider) => Ok(start(Some(provider), Sink::Stdout)),
+        Err(err) => {
+            // Logging still starts, so the app can say why it is exiting.
+            crate::logging::install(Sink::Stdout, None);
+            Err(err)
+        }
+    }
+}
+
+/// Exports to Alloy's OTLP/gRPC receiver at `endpoint`, plaintext because it
+/// never leaves the cluster network.
+fn provider(service: &'static str, endpoint: &str) -> Result<SdkTracerProvider> {
     let exporter = SpanExporter::builder()
         .with_tonic()
         .with_endpoint(format!("http://{endpoint}"))
         .build()
         .context("create otlp exporter")?;
-    let provider = SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_resource(Resource::builder().with_service_name(service).build())
+    let batch = BatchConfigBuilder::default()
+        .with_max_queue_size(QUEUE)
+        .with_max_export_batch_size(QUEUE)
         .build();
-    global::set_tracer_provider(provider.clone());
+    let processor = BatchSpanProcessor::builder(exporter)
+        .with_batch_config(batch)
+        .build();
+    Ok(SdkTracerProvider::builder()
+        .with_span_processor(processor)
+        .with_resource(Resource::builder().with_service_name(service).build())
+        .build())
+}
+
+fn start(provider: Option<SdkTracerProvider>, sink: Sink) -> Tracing {
     global::set_text_map_propagator(TraceContextPropagator::new());
-    Ok(Tracing {
-        provider: Some(provider),
-    })
+    if let Some(provider) = &provider {
+        global::set_tracer_provider(provider.clone());
+    }
+    let tracer = provider.as_ref().map(|p| p.tracer("homelab"));
+    crate::logging::install(sink, tracer);
+    Tracing { provider }
+}
+
+/// [`crate::init`] for a test: spans go to `provider`, and the log lines are
+/// kept and returned rather than written.
+#[doc(hidden)]
+pub fn init_capturing(provider: SdkTracerProvider) -> (Tracing, Arc<Mutex<Vec<String>>>) {
+    let lines = Arc::default();
+    let tracing = start(Some(provider), Sink::Capture(Arc::clone(&lines)));
+    (tracing, lines)
 }
 
 impl Tracing {
@@ -81,34 +137,55 @@ pub(crate) async fn middleware(mut req: Request, next: Next) -> Response {
     let slot = crate::http::RouteSlot::default();
     req.extensions_mut().insert(slot.clone());
 
-    let tracer = global::tracer("homelab");
-    let span = tracer
-        .span_builder(span_name(&method, None))
-        .with_kind(SpanKind::Server)
-        .with_attributes(request_attrs(&req))
-        .start_with_context(&tracer, &parent);
-    let cx = parent.with_span(span);
+    // Every attribute is declared here, because a tracing span's fields are
+    // fixed when it is created; the ones a request lacks stay empty and are
+    // not exported.
+    let span = tracing::info_span!(
+        target: "homelab::http",
+        "request",
+        otel.name = span_name(&method, None),
+        otel.kind = "server",
+        otel.status_code = Empty,
+        server.address = Empty,
+        server.port = Empty,
+        http.request.method = Empty,
+        http.request.method_original = Empty,
+        url.scheme = "http",
+        url.path = Empty,
+        network.peer.address = Empty,
+        network.peer.port = Empty,
+        network.protocol.version = Empty,
+        user_agent.original = Empty,
+        client.address = Empty,
+        http.route = Empty,
+        http.response.status_code = Empty,
+        http.response.body.size = Empty,
+    );
+    // Before the span is first entered: that is when it starts, and its parent
+    // is fixed from then on.
+    let _ = span.set_parent(parent);
+    record_request(&span, &req);
 
-    let res = next.run(req).with_context(cx.clone()).await;
+    let res = next.run(req).instrument(span.clone()).await;
 
-    let span = cx.span();
     if let Some(route) = matched.or_else(|| slot.take()) {
         let path = route.split_once(' ').map_or(route.as_str(), |(_, p)| p);
-        span.set_attribute(KeyValue::new("http.route", path.to_string()));
-        span.update_name(span_name(&method, Some(path)));
+        span.record("http.route", path);
+        // Through the OpenTelemetry span rather than recording otel.name: the
+        // span started when it was first entered, and tracing-opentelemetry
+        // applies only attributes and status to a started span.
+        span.context()
+            .span()
+            .update_name(span_name(&method, Some(path)));
     }
     if let Some(size) = res.body().size_hint().exact().filter(|&n| n > 0) {
-        span.set_attribute(KeyValue::new("http.response.body.size", size as i64));
+        span.record("http.response.body.size", size as i64);
     }
     let status = res.status();
-    span.set_attribute(KeyValue::new(
-        "http.response.status_code",
-        i64::from(status.as_u16()),
-    ));
+    span.record("http.response.status_code", i64::from(status.as_u16()));
     if status.is_server_error() {
-        span.set_status(Status::error(""));
+        span.record("otel.status_code", "ERROR");
     }
-    span.end();
     res
 }
 
@@ -140,7 +217,7 @@ fn span_name(method: &Method, path: Option<&str>) -> String {
 }
 
 /// The semantic-convention request attributes.
-fn request_attrs(req: &Request) -> Vec<KeyValue> {
+fn record_request(span: &tracing::Span, req: &Request) {
     let host = req
         .uri()
         .authority()
@@ -148,24 +225,17 @@ fn request_attrs(req: &Request) -> Vec<KeyValue> {
         .or_else(|| header_str(req.headers(), header::HOST.as_str()))
         .unwrap_or_default();
     let (host, port) = split_host_port(&host);
+    span.record("server.address", host);
+    if let Some(port) = port.filter(|&p| p != 80) {
+        span.record("server.port", i64::from(port));
+    }
 
-    let mut attrs = Vec::with_capacity(12);
-    attrs.push(KeyValue::new("server.address", host));
     let method = req.method();
     if KNOWN_METHODS.contains(method) {
-        attrs.push(KeyValue::new("http.request.method", method.to_string()));
+        span.record("http.request.method", method.as_str());
     } else {
-        attrs.push(KeyValue::new("http.request.method", "_OTHER"));
-    }
-    attrs.push(KeyValue::new("url.scheme", "http"));
-    if let Some(port) = port.filter(|&p| p != 80) {
-        attrs.push(KeyValue::new("server.port", i64::from(port)));
-    }
-    if !KNOWN_METHODS.contains(method) {
-        attrs.push(KeyValue::new(
-            "http.request.method_original",
-            method.to_string(),
-        ));
+        span.record("http.request.method", "_OTHER");
+        span.record("http.request.method_original", method.as_str());
     }
 
     let peer = req
@@ -173,13 +243,13 @@ fn request_attrs(req: &Request) -> Vec<KeyValue> {
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0);
     if let Some(peer) = peer {
-        attrs.push(KeyValue::new("network.peer.address", peer.ip().to_string()));
-        attrs.push(KeyValue::new("network.peer.port", i64::from(peer.port())));
+        span.record("network.peer.address", peer.ip().to_string());
+        span.record("network.peer.port", i64::from(peer.port()));
     }
     if let Some(ua) =
         header_str(req.headers(), header::USER_AGENT.as_str()).filter(|s| !s.is_empty())
     {
-        attrs.push(KeyValue::new("user_agent.original", ua));
+        span.record("user_agent.original", ua);
     }
     // The first X-Forwarded-For entry, else the peer. Behind cloudflared that
     // is cloudflared's view of the visitor.
@@ -188,13 +258,12 @@ fn request_attrs(req: &Request) -> Vec<KeyValue> {
         .filter(|s| !s.is_empty())
         .or_else(|| peer.map(|p| p.ip().to_string()));
     if let Some(client) = client {
-        attrs.push(KeyValue::new("client.address", client));
+        span.record("client.address", client);
     }
-    attrs.push(KeyValue::new("url.path", decoded_path(req.uri().path())));
+    span.record("url.path", decoded_path(req.uri().path()));
     if let Some(version) = protocol_version(req.version()) {
-        attrs.push(KeyValue::new("network.protocol.version", version));
+        span.record("network.protocol.version", version);
     }
-    attrs
 }
 
 /// url.path is the decoded path.
@@ -245,35 +314,6 @@ impl Extractor for Headers<'_> {
     fn keys(&self) -> Vec<&str> {
         self.0.keys().map(|k| k.as_str()).collect()
     }
-}
-
-/// Runs `fut` inside a child span of the current one, recording its error on
-/// the span. Wrapping a store method's body this
-/// way makes a slow query its own span rather than time folded into the
-/// handler that called it.
-pub async fn op<T, E: std::fmt::Display>(
-    tracer: &'static str,
-    name: &'static str,
-    attrs: Vec<KeyValue>,
-    fut: impl Future<Output = std::result::Result<T, E>>,
-) -> std::result::Result<T, E> {
-    let tracer = global::tracer(tracer);
-    let span = tracer
-        .span_builder(name)
-        .with_attributes(attrs)
-        .start_with_context(&tracer, &Context::current());
-    let cx = Context::current_with_span(span);
-    let result = fut.with_context(cx.clone()).await;
-    let span = cx.span();
-    if let Err(err) = &result {
-        span.add_event(
-            "exception",
-            vec![KeyValue::new("exception.message", err.to_string())],
-        );
-        span.set_status(Status::error(err.to_string()));
-    }
-    span.end();
-    result
 }
 
 #[cfg(test)]

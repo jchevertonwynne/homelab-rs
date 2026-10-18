@@ -4,7 +4,11 @@
 //! the method and axum's matched path — never its raw path, so a metric has
 //! one series per route rather than one per row ever created, and a span is
 //! named for what it did. A request no route matched is `unmatched`.
+//!
+//! A handler that panics is a 500, counted under its route and logged inside
+//! its span, rather than a connection reset that no metric or trace records.
 
+use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -12,6 +16,7 @@ use axum::extract::{MatchedPath, Request};
 use axum::http::{StatusCode, header};
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
+use tower_http::catch_panic::CatchPanicLayer;
 
 /// Puts the metrics middleware and a server span around every route of
 /// `router`, its fallback included.
@@ -21,6 +26,9 @@ use axum::response::{IntoResponse, Response};
 pub fn instrument(router: Router) -> Router {
     crate::metrics::register();
     router
+        // Innermost, so the 500 it makes of a panic is what the metrics and
+        // the span see.
+        .layer(CatchPanicLayer::custom(panicked))
         .layer(from_fn_with_state(
             crate::metrics::Labels::new(&[]),
             crate::metrics::middleware,
@@ -46,8 +54,10 @@ pub fn instrument(router: Router) -> Router {
 pub fn instrument_layered(outer: Router, app: Router, excluded: &[&str]) -> Router {
     crate::metrics::register();
     let labels = crate::metrics::Labels::new(excluded);
-    // Outermost on app, so both run before app's own wrapper.
+    // Outermost on app, so both run before app's own wrapper; the panic
+    // catcher inside them, as in instrument.
     let app = app
+        .layer(CatchPanicLayer::custom(panicked))
         .layer(from_fn_with_state(
             labels.clone(),
             crate::metrics::middleware,
@@ -56,6 +66,7 @@ pub fn instrument_layered(outer: Router, app: Router, excluded: &[&str]) -> Rout
     outer
         // route_layer: outer's own routes only. A request handed to app is
         // counted there, once.
+        .route_layer(CatchPanicLayer::custom(panicked))
         .route_layer(from_fn_with_state(labels, crate::metrics::middleware))
         .fallback_service(app)
         .layer(from_fn(crate::trace::middleware))
@@ -85,6 +96,19 @@ pub(crate) fn route(req: &Request) -> Option<String> {
     req.extensions()
         .get::<MatchedPath>()
         .map(|p| format!("{} {}", req.method(), p.as_str()))
+}
+
+/// The response for a handler that panicked. The message goes to the log, not
+/// the client; Rust's panic hook has already written where it happened to
+/// stderr.
+fn panicked(panic: Box<dyn Any + Send + 'static>) -> Response {
+    let msg = panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a non-string panic payload".to_string());
+    tracing::error!(panic = msg, "handler panicked");
+    error(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
 }
 
 /// A plain-text response for a status and a message, `nosniff` so it is never

@@ -9,7 +9,13 @@
 //!
 //! Log with the `tracing` macros: `tracing::error!(error = %err, "encode
 //! response")` writes `{"time":…,"level":"ERROR","msg":"encode response",
-//! "error":"…"}`.
+//! "error":"…"}`. An event with no message — the error `#[instrument(err)]`
+//! records — takes its span's name as its `msg`.
+//!
+//! [`crate::init`] installs it, and with it the span layer: the same subscriber
+//! carries tracing-opentelemetry, so a `tracing` span is an OpenTelemetry
+//! span, and entering one makes its context current — which is where a line's
+//! `trace_id` and `span_id` come from.
 //!
 //! Never log user identifiers or user content through this — no email, session
 //! or CSRF value, Access JWT, request header or body. These lines leave the
@@ -17,57 +23,91 @@
 
 use std::fmt::{self, Write as _};
 use std::io::Write as _;
+use std::sync::{Arc, Mutex};
 
 use opentelemetry::trace::TraceContextExt;
+use opentelemetry_sdk::trace::SdkTracer;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
 
-/// Must run before anything that logs; until it does, events go nowhere.
-pub fn init() {
+/// Installs the process's subscriber: the JSON lines, and the span layer
+/// when there is a tracer to export through. It goes in whole, once — the
+/// span layer cannot be added later, because tracing-opentelemetry finds
+/// itself by downcasting the subscriber, which a reloadable layer refuses.
+pub(crate) fn install(sink: Sink, tracer: Option<SdkTracer>) {
     // The OpenTelemetry SDK narrates its own lifecycle at INFO ("Global tracer
     // provider is set"), which is noise in Loki; its warnings and errors —
-    // an export that failed — are worth keeping.
+    // an export that failed — are worth keeping. The same filter decides which
+    // spans exist: INFO and up, so the TRACE-level spans of hyper, h2 and
+    // tonic — the exporter's own transport among them — never become spans.
     let filter = Targets::new()
         .with_default(LevelFilter::INFO)
         .with_target("opentelemetry", LevelFilter::WARN)
         .with_target("opentelemetry_sdk", LevelFilter::WARN)
         .with_target("opentelemetry_otlp", LevelFilter::WARN);
-    let subscriber = tracing_subscriber::registry().with(filter).with(JsonLines);
+    let spans = tracer.map(|tracer| {
+        tracing_opentelemetry::layer()
+            .with_tracer(tracer)
+            // A tokio task moves between threads, so a span's thread says
+            // nothing; and the name says what a span is, where the source
+            // location of the request span would only ever be this crate's
+            // middleware, in whatever cargo checkout the image was built from.
+            .with_threads(false)
+            .with_location(false)
+    });
+    let subscriber = tracing_subscriber::registry()
+        .with(spans)
+        .with(filter)
+        .with(JsonLines(sink));
     // Only fails if a subscriber is already installed, which means init ran
     // twice; the first one is the one that counts.
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
-struct JsonLines;
+/// Where the lines go: stdout, or kept for a test that reads what was logged.
+pub(crate) enum Sink {
+    Stdout,
+    Capture(Arc<Mutex<Vec<String>>>),
+}
 
-impl<S: Subscriber> Layer<S> for JsonLines {
-    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        let mut line = render(event, &jiff::Zoned::now());
-        line.push('\n');
-        // One write per line under the lock, so concurrent requests cannot
-        // interleave inside a record. A failed write to stdout has nowhere
-        // else to be reported.
-        let _ = std::io::stdout().lock().write_all(line.as_bytes());
+struct JsonLines(Sink);
+
+impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for JsonLines {
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        let span = ctx.event_span(event).map(|s| s.name());
+        let mut line = render(event, span, &jiff::Zoned::now());
+        match &self.0 {
+            Sink::Stdout => {
+                line.push('\n');
+                // One write per line under the lock, so concurrent requests
+                // cannot interleave inside a record. A failed write to stdout
+                // has nowhere else to be reported.
+                let _ = std::io::stdout().lock().write_all(line.as_bytes());
+            }
+            Sink::Capture(lines) => lines.lock().unwrap_or_else(|e| e.into_inner()).push(line),
+        }
     }
 }
 
 /// The record without its newline. Split from `on_event` so tests can pin the
 /// clock.
-fn render(event: &Event<'_>, now: &jiff::Zoned) -> String {
+fn render(event: &Event<'_>, span: Option<&str>, now: &jiff::Zoned) -> String {
     let mut fields = Fields::default();
     event.record(&mut fields);
-    // The OpenTelemetry SDK logs events with a name and no message
-    // ("BatchSpanProcessor.ExportError"); the name is the only thing that says
-    // what the line is about, so it stands in.
+    // An event with no message still needs a msg that says what it is about.
+    // The OpenTelemetry SDK's carry a name ("BatchSpanProcessor.ExportError");
+    // the error #[instrument(err)] records has only its span to go by.
     let msg = if fields.msg.is_empty() {
         fields
             .attrs
             .iter()
             .find(|(k, _)| *k == "name")
             .and_then(|(_, v)| serde_json::from_str::<String>(v).ok())
+            .or_else(|| span.map(str::to_string))
             .unwrap_or_default()
     } else {
         fields.msg.clone()
@@ -220,19 +260,18 @@ impl Visit for Fields {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-    use tracing_subscriber::layer::SubscriberExt;
 
     /// Captures what the layer would have written, with the clock fixed.
     #[derive(Clone, Default)]
     struct Capture(Arc<Mutex<Vec<String>>>);
 
-    impl<S: Subscriber> Layer<S> for Capture {
-        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+    impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Capture {
+        fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
             let now: jiff::Zoned = "2026-10-14T09:30:01.234567+01:00[Europe/London]"
                 .parse()
                 .unwrap();
-            self.0.lock().unwrap().push(render(event, &now));
+            let span = ctx.event_span(event).map(|s| s.name());
+            self.0.lock().unwrap().push(render(event, span, &now));
         }
     }
 
@@ -284,6 +323,19 @@ mod tests {
             lines[0].ends_with(
                 r#""msg":"hello","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7"}"#
             ),
+            "{}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn an_event_with_no_message_is_named_for_its_span() {
+        let lines = capture(|| {
+            let _span = tracing::info_span!("db.query").entered();
+            tracing::error!(error = "disk I/O error");
+        });
+        assert!(
+            lines[0].ends_with(r#""level":"ERROR","msg":"db.query","error":"disk I/O error"}"#),
             "{}",
             lines[0]
         );

@@ -1,6 +1,6 @@
 [package]
 name = "homelab"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 description = "Observability and serving for the homelab's axum services, matching homelab-go's signals"
 publish = false
@@ -26,6 +26,8 @@ prometheus = { version = "0.14", default-features = false, features = ["process"
 opentelemetry = "0.33"
 opentelemetry_sdk = "0.33"
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "grpc-tonic"] }
+tracing-opentelemetry = "0.34"
+tower-http = { version = "0.6", features = ["catch-panic"] }
 
 # The allocator, its stats and its heap profiler. Linux only: jemalloc_pprof
 # reads /proc/self/maps, and the stats exist to be scraped in the cluster. On
