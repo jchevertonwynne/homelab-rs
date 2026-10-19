@@ -27,7 +27,7 @@ opentelemetry = "0.33"
 opentelemetry_sdk = "0.33"
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "grpc-tonic"] }
 tracing-opentelemetry = "0.34"
-tower-http = { version = "0.6", features = ["catch-panic"] }
+tower-http = { version = "0.7", features = ["catch-panic"] }
 
 # The allocator, its stats and its heap profiler. Linux only: jemalloc_pprof
 # reads /proc/self/maps, and the stats exist to be scraped in the cluster. On
