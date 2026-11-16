@@ -19,7 +19,7 @@ sha2 = "0.11"
 hex = "0.4"
 # Bundled so TZ resolves on a scratch image, which has no zoneinfo: Go's
 # time/tzdata import is what weight-tracker relies on for the same reason.
-jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
+jiff = { version = "1.0", features = ["tzdb-bundle-always"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 prometheus = { version = "0.14", default-features = false, features = ["process"] }
